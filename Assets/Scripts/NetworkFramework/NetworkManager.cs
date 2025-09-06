@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
 using UnityEngine;
 
 public class NetworkManager : MonoBehaviour
@@ -50,9 +52,22 @@ public class NetworkManager : MonoBehaviour
     private bool _isClosing = false;
     private bool _isApplicationQuitting = false;
 
+    private UdpClient _udpClient;
+    private IPEndPoint _serverUdpEndPoint;
+    private const int UdpPort = 9000;
+
+    [SerializeField] private string serverIp = "127.0.0.1";
+    [SerializeField] private int serverTcpPort = 8080;
+
+    [SerializeField] private float remoteLerpSpeed = 12f;   // 越大越快跟上
+
     void Start()
     {
-        _ = ConnectAsync("127.0.0.1", 8080);
+        _serverUdpEndPoint = new IPEndPoint(IPAddress.Parse(serverIp), UdpPort);
+        _udpClient = new UdpClient();
+        _ = ReceiveUdpLoopAsync();
+
+        _ = ConnectAsync(serverIp, serverTcpPort);
     }
 
     public async Task ConnectAsync(string host, int port)
@@ -67,13 +82,11 @@ public class NetworkManager : MonoBehaviour
             _stream = _client.GetStream();
 
             Debug.Log("连接服务器成功");
-
             _ = ReceiveLoopAsync(_cts.Token);
 
             await PerformKeyExchangeAsync();
 
             _lastPongTime = Time.time;
-
             _reconnectAttempts = 0;
         }
         catch (Exception ex)
@@ -112,7 +125,7 @@ public class NetworkManager : MonoBehaviour
             if (!_isApplicationQuitting)
             {
                 Debug.LogError($"发送异常: {e.Message}");
-                _ = TryReconnectAsync("127.0.0.1", 8080);
+                _ = TryReconnectAsync(serverIp, serverTcpPort);
             }
         }
     }
@@ -141,7 +154,7 @@ public class NetworkManager : MonoBehaviour
             if (!_isApplicationQuitting)
             {
                 Debug.LogWarning($"接收异常: {e.Message}");
-                _ = TryReconnectAsync("127.0.0.1", 8080);
+                _ = TryReconnectAsync(serverIp, serverTcpPort);
             }
         }
     }
@@ -218,16 +231,16 @@ public class NetworkManager : MonoBehaviour
                 Debug.Log($"登录成功! 玩家ID={loginResp.data.playerId}");
                 _myPlayerId = loginResp.data.playerId;
                 SpawnPlayer(_myPlayerId, true);
+                _ = SendUdpMoveAsync(_myPlayerId, _players[_myPlayerId].transform.position);
                 break;
 
             case MSG_MOVE_BROADCAST:
                 var mv = MsgUtil.DecodeMessage<MoveBroadcast>(plainBody);
-                UpdateOrSpawnRemotePlayer(mv.data.playerId, mv.data.x, mv.data.y, mv.data.z);
+                UpdateOrSpawnRemotePlayer(mv.data.playerId, mv.data.x, mv.data.y, mv.data.z, true);
                 break;
 
             case MSG_PLAYER_JOIN:
                 var joinMsg = MsgUtil.DecodeMessage<PlayerJoinBroadcast>(plainBody);
-                Debug.Log($"收到玩家加入广播: playerId={joinMsg.data.playerId}");
                 if (joinMsg.data.playerId != _myPlayerId && !_players.ContainsKey(joinMsg.data.playerId))
                 {
                     SpawnPlayer(joinMsg.data.playerId, false);
@@ -236,16 +249,15 @@ public class NetworkManager : MonoBehaviour
 
             case MSG_PLAYER_LEAVE:
                 var leaveMsg = MsgUtil.DecodeMessage<PlayerLeaveBroadcast>(plainBody);
-                Debug.Log($"收到玩家离开广播: playerId={leaveMsg.data.playerId}");
                 if (_players.ContainsKey(leaveMsg.data.playerId))
                 {
                     Destroy(_players[leaveMsg.data.playerId]);
                     _players.Remove(leaveMsg.data.playerId);
+                    _remoteStates.Remove(leaveMsg.data.playerId);
                 }
                 break;
 
             case MSG_HEARTBEAT:
-                var heartbeat = MsgUtil.DecodeMessage<HeartbeatMsg>(plainBody);
                 _lastPongTime = Time.time;
                 break;
 
@@ -256,7 +268,14 @@ public class NetworkManager : MonoBehaviour
     }
 
     private int _myPlayerId = -1;
+
     private readonly Dictionary<int, GameObject> _players = new();
+
+    private class RemoteState
+    {
+        public Vector3 Target;
+    }
+    private readonly Dictionary<int, RemoteState> _remoteStates = new();
 
     private void SpawnPlayer(int playerId, bool isLocal)
     {
@@ -269,30 +288,16 @@ public class NetworkManager : MonoBehaviour
 
         if (isLocal)
         {
-            if (localPlayerMaterial != null)
-            {
-                renderer.material = localPlayerMaterial;
-            }
-            else
-            {
-                var material = new Material(Shader.Find("Standard"));
-                material.color = Color.green;
-                renderer.material = material;
-            }
+            if (localPlayerMaterial != null) renderer.material = localPlayerMaterial;
+            else { var m = new Material(Shader.Find("Standard")); m.color = Color.green; renderer.material = m; }
             go.AddComponent<LocalPlayerController>().Init(this, playerId);
         }
         else
         {
-            if (remotePlayerMaterial != null)
-            {
-                renderer.material = remotePlayerMaterial;
-            }
-            else
-            {
-                var material = new Material(Shader.Find("Standard"));
-                material.color = Color.red;
-                renderer.material = material;
-            }
+            if (remotePlayerMaterial != null) renderer.material = remotePlayerMaterial;
+            else { var m = new Material(Shader.Find("Standard")); m.color = Color.red; renderer.material = m; }
+
+            _remoteStates[playerId] = new RemoteState { Target = Vector3.zero };
         }
         _players[playerId] = go;
 
@@ -303,7 +308,7 @@ public class NetworkManager : MonoBehaviour
         }
     }
 
-    private void UpdateOrSpawnRemotePlayer(int playerId, float x, float y, float z)
+    private void UpdateOrSpawnRemotePlayer(int playerId, float x, float y, float z, bool snap = false)
     {
         if (!_players.ContainsKey(playerId))
         {
@@ -311,7 +316,49 @@ public class NetworkManager : MonoBehaviour
         }
 
         var go = _players[playerId];
-        go.transform.position = new Vector3(x, y, z);
+        if (playerId == _myPlayerId)
+        {
+            if (snap) go.transform.position = new Vector3(x, y, z);
+            return;
+        }
+
+        if (!_remoteStates.ContainsKey(playerId))
+            _remoteStates[playerId] = new RemoteState();
+
+        _remoteStates[playerId].Target = new Vector3(x, y, z);
+
+        if (snap) go.transform.position = _remoteStates[playerId].Target;
+    }
+
+    public async Task SendUdpMoveAsync(int playerId, Vector3 pos)
+    {
+        try
+        {
+            var mv = new MoveBroadcast { playerId = playerId, x = pos.x, y = pos.y, z = pos.z };
+            var json = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(mv));
+            await _udpClient.SendAsync(json, json.Length, _serverUdpEndPoint);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"UDP 发送失败: {e.Message}");
+        }
+    }
+
+    private async Task ReceiveUdpLoopAsync()
+    {
+        while (!_isApplicationQuitting)
+        {
+            try
+            {
+                var result = await _udpClient.ReceiveAsync();
+                var mv = JsonConvert.DeserializeObject<MoveBroadcast>(Encoding.UTF8.GetString(result.Buffer));
+                if (mv == null) continue;
+                if (mv.playerId == _myPlayerId) continue;
+
+                UpdateOrSpawnRemotePlayer(mv.playerId, mv.x, mv.y, mv.z);
+            }
+            catch {}
+        }
     }
 
     private async Task PerformKeyExchangeAsync()
@@ -324,10 +371,9 @@ public class NetworkManager : MonoBehaviour
         _aesKey = new byte[32];
         RandomNumberGenerator.Fill(_aesKey);
 
-        byte[] encryptedAesKey;
         var rsaProv = new RSACryptoServiceProvider();
         rsaProv.FromXmlString(serverPubKeyXml);
-        encryptedAesKey = rsaProv.Encrypt(_aesKey, true);
+        var encryptedAesKey = rsaProv.Encrypt(_aesKey, true);
         rsaProv.Dispose();
 
         var b64 = Convert.ToBase64String(encryptedAesKey);
@@ -361,10 +407,8 @@ public class NetworkManager : MonoBehaviour
         aes.Padding = PaddingMode.PKCS7;
         aes.Key = _aesKey;
         aes.GenerateIV();
-
         using var encryptor = aes.CreateEncryptor();
         var cipher = encryptor.TransformFinalBlock(plain, 0, plain.Length);
-
         var result = new byte[aes.IV.Length + cipher.Length];
         Array.Copy(aes.IV, 0, result, 0, aes.IV.Length);
         Array.Copy(cipher, 0, result, aes.IV.Length, cipher.Length);
@@ -385,7 +429,6 @@ public class NetworkManager : MonoBehaviour
         aes.Padding = PaddingMode.PKCS7;
         aes.Key = _aesKey;
         aes.IV = iv;
-
         using var decryptor = aes.CreateDecryptor();
         return decryptor.TransformFinalBlock(cipher, 0, cipher.Length);
     }
@@ -394,11 +437,7 @@ public class NetworkManager : MonoBehaviour
     {
         if (_reconnecting || _isApplicationQuitting) return;
 
-        lock (_closeLock)
-        {
-            if (_isClosing || _isApplicationQuitting) return;
-        }
-
+        lock (_closeLock) { if (_isClosing || _isApplicationQuitting) return; }
         _reconnecting = true;
 
         try
@@ -411,119 +450,56 @@ public class NetworkManager : MonoBehaviour
 
             _reconnectAttempts++;
             Debug.LogWarning($"尝试重连中... (第{_reconnectAttempts}次)");
-
             CloseConnection();
 
-            for (int i = 0; i < 30; i++)
-            {
-                if (_isApplicationQuitting) return;
-                await Task.Delay(100);
-            }
-
-            if (!_isApplicationQuitting)
-            {
-                await ConnectAsync(host, port);
-            }
+            for (int i = 0; i < 30; i++) { if (_isApplicationQuitting) return; await Task.Delay(100); }
+            if (!_isApplicationQuitting) { await ConnectAsync(host, port); }
         }
         catch (Exception ex)
         {
-            if (!_isApplicationQuitting)
-            {
-                Debug.LogError($"重连过程中发生异常: {ex.Message}");
-            }
+            if (!_isApplicationQuitting) Debug.LogError($"重连过程中发生异常: {ex.Message}");
         }
-        finally
-        {
-            _reconnecting = false;
-        }
+        finally { _reconnecting = false; }
     }
 
     private void CloseConnection()
     {
-        lock (_closeLock)
-        {
-            if (_isClosing) return;
-            _isClosing = true;
-        }
+        lock (_closeLock) { if (_isClosing) return; _isClosing = true; }
 
         try
         {
             Debug.Log("正在关闭网络连接...");
 
-            try
-            {
-                _cts?.Cancel();
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"取消异步操作时出错: {ex.Message}");
-            }
-
+            try { _cts?.Cancel(); } catch (Exception ex) { Debug.LogWarning($"取消异步操作时出错: {ex.Message}"); }
             try
             {
                 _pubKeyTcs?.TrySetCanceled();
                 _aesAckTcs?.TrySetCanceled();
-                _pubKeyTcs = null;
-                _aesAckTcs = null;
+                _pubKeyTcs = null; _aesAckTcs = null;
             }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"重置TaskCompletionSource时出错: {ex.Message}");
-            }
+            catch (Exception ex) { Debug.LogWarning($"重置TaskCompletionSource时出错: {ex.Message}"); }
 
-            try
-            {
-                _stream?.Close();
-                _stream?.Dispose();
-                _stream = null;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"关闭网络流时出错: {ex.Message}");
-            }
+            try { _stream?.Close(); _stream?.Dispose(); _stream = null; } catch (Exception ex) { Debug.LogWarning($"关闭网络流时出错: {ex.Message}"); }
 
             try
             {
                 if (_client != null)
                 {
-                    if (_client.Connected)
-                    {
-                        _client.GetStream()?.Close();
-                    }
-                    _client.Close();
-                    _client = null;
+                    if (_client.Connected) _client.GetStream()?.Close();
+                    _client.Close(); _client = null;
                 }
             }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"关闭TCP客户端时出错: {ex.Message}");
-            }
+            catch (Exception ex) { Debug.LogWarning($"关闭TCP客户端时出错: {ex.Message}"); }
 
-            _encryptionEnabled = false;
-            _aesKey = null;
-            _cache = new byte[0];
-            _myPlayerId = -1;
-            _lastHeartbeat = 0;
-            _lastPongTime = 0;
+            _encryptionEnabled = false; _aesKey = null; _cache = new byte[0];
+            _myPlayerId = -1; _lastHeartbeat = 0; _lastPongTime = 0;
 
-            if (!_isApplicationQuitting)
-            {
-                ClearAllPlayers();
-            }
+            if (!_isApplicationQuitting) ClearAllPlayers();
 
             Debug.Log("网络连接已关闭");
         }
-        catch (Exception ex)
-        {
-            Debug.LogError($"关闭连接时发生异常: {ex.Message}");
-        }
-        finally
-        {
-            lock (_closeLock)
-            {
-                _isClosing = false;
-            }
-        }
+        catch (Exception ex) { Debug.LogError($"关闭连接时发生异常: {ex.Message}"); }
+        finally { lock (_closeLock) { _isClosing = false; } }
     }
 
     private void ClearAllPlayers()
@@ -532,12 +508,10 @@ public class NetworkManager : MonoBehaviour
         {
             foreach (var kv in _players)
             {
-                if (kv.Value != null)
-                {
-                    Destroy(kv.Value);
-                }
+                if (kv.Value != null) Destroy(kv.Value);
             }
             _players.Clear();
+            _remoteStates.Clear();
             Debug.Log("已清理所有玩家对象");
         }
         catch (Exception ex)
@@ -557,12 +531,20 @@ public class NetworkManager : MonoBehaviour
                 _ = SendMsgAsync(MSG_HEARTBEAT, new { ping = "ping" });
                 _lastHeartbeat = Time.time;
             }
-
             if (Time.time - _lastPongTime > HeartbeatTimeout)
             {
                 Debug.LogWarning("心跳超时，断开重连");
-                _ = TryReconnectAsync("127.0.0.1", 8080);
+                _ = TryReconnectAsync(serverIp, serverTcpPort);
             }
+        }
+
+        foreach (var kv in _remoteStates)
+        {
+            var id = kv.Key;
+            if (!_players.ContainsKey(id)) continue;
+            var go = _players[id];
+            var target = kv.Value.Target;
+            go.transform.position = Vector3.Lerp(go.transform.position, target, 1f - Mathf.Exp(-remoteLerpSpeed * Time.deltaTime));
         }
     }
 
@@ -572,15 +554,8 @@ public class NetworkManager : MonoBehaviour
         _isApplicationQuitting = true;
         CloseConnection();
 
-        try
-        {
-            _cts?.Dispose();
-            _cts = null;
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning($"释放 CancellationTokenSource 时出错: {ex.Message}");
-        }
+        try { _cts?.Dispose(); _cts = null; } catch (Exception ex) { Debug.LogWarning($"释放 CancellationTokenSource 时出错: {ex.Message}"); }
+        try { _udpClient?.Dispose(); } catch { }
     }
 
     void OnApplicationQuit()
@@ -588,6 +563,7 @@ public class NetworkManager : MonoBehaviour
         Debug.Log("应用程序正在退出");
         _isApplicationQuitting = true;
         CloseConnection();
+        try { _udpClient?.Dispose(); } catch { }
     }
 
     void OnApplicationPause(bool pauseStatus)
@@ -601,37 +577,12 @@ public class NetworkManager : MonoBehaviour
 
     void OnApplicationFocus(bool hasFocus)
     {
-        if (!hasFocus)
-        {
-            Debug.Log("应用失去焦点");
-        }
+        if (!hasFocus) Debug.Log("应用失去焦点");
     }
-
-#if UNITY_EDITOR
-    [UnityEditor.InitializeOnLoadMethod]
-    static void OnEditorLoad()
-    {
-        UnityEditor.EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
-    }
-
-    static void OnPlayModeStateChanged(UnityEditor.PlayModeStateChange state)
-    {
-        if (state == UnityEditor.PlayModeStateChange.ExitingPlayMode)
-        {
-            Debug.Log("编辑器退出播放模式，清理网络连接");
-            var networkManager = FindObjectOfType<NetworkManager>();
-            if (networkManager != null)
-            {
-                networkManager._isApplicationQuitting = true;
-                networkManager.CloseConnection();
-            }
-        }
-    }
-#endif
 
     [Serializable] public class PlayerJoinBroadcast { public int playerId; }
     [Serializable] public class PlayerLeaveBroadcast { public int playerId; }
-    [Serializable] public class LoginResponse { public int playerId; }
+    [Serializable] public class LoginResponse { public int playerId; public string result; }
     [Serializable] public class MoveBroadcast { public int playerId; public float x; public float y; public float z; }
     [Serializable] public class HeartbeatMsg { public string ping; }
     [Serializable] private class ServerPubKeyMsg { public string publicKey; }

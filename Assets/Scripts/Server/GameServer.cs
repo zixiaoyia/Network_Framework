@@ -18,6 +18,9 @@ namespace SimpleGameServer
         public static readonly ConcurrentDictionary<int, ClientSession> _sessions = new();
         static int _nextPlayerId = 0;
 
+        private static UdpClient _udpServer;
+        private const int UdpPort = 9000;
+
         static async Task Main(string[] args)
         {
             Console.WriteLine("服务器启动...");
@@ -25,9 +28,12 @@ namespace SimpleGameServer
             _pubKeyXml = _rsaProvider.ToXmlString(false);
             Console.WriteLine("生成 RSA 公钥 (XML 格式)");
 
+            StartUdpServer();
+
             var listener = new TcpListener(IPAddress.Any, 8080);
             listener.Start();
-            Console.WriteLine("监听端口 8080");
+            Console.WriteLine("TCP 监听端口 8080");
+            Console.WriteLine($"UDP 监听端口 {UdpPort}");
 
             while (true)
             {
@@ -49,6 +55,70 @@ namespace SimpleGameServer
         {
             return System.Threading.Interlocked.Increment(ref _nextPlayerId);
         }
+
+        static void StartUdpServer()
+        {
+            _udpServer = new UdpClient(new IPEndPoint(IPAddress.Any, UdpPort));
+            _ = ReceiveUdpLoopAsync();
+        }
+
+        private static async Task ReceiveUdpLoopAsync()
+        {
+            while (true)
+            {
+                try
+                {
+                    var result = await _udpServer.ReceiveAsync();
+                    HandleUdpPacket(result.Buffer, result.RemoteEndPoint);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("UDP接收异常: " + ex.Message);
+                }
+            }
+        }
+
+        private static void HandleUdpPacket(byte[] packet, IPEndPoint sender)
+        {
+            try
+            {
+                var json = Encoding.UTF8.GetString(packet);
+                var mv = JsonConvert.DeserializeObject<MoveBroadcast>(json);
+                if (mv == null || mv.playerId <= 0) return;
+
+                if (_sessions.TryGetValue(mv.playerId, out var session))
+                {
+                    if (session.UdpEndPoint == null)
+                    {
+                        session.UdpEndPoint = sender;
+                        Console.WriteLine($"登记玩家 {mv.playerId} 的 UDP 端点: {sender}");
+                    }
+
+                    session.X = mv.x; session.Y = mv.y; session.Z = mv.z;
+
+                    var b = Encoding.UTF8.GetBytes(json);
+                    foreach (var kv in _sessions)
+                    {
+                        if (kv.Key == mv.playerId) continue;
+                        var s = kv.Value;
+                        if (s.PlayerId > 0 && s.UdpEndPoint != null)
+                        {
+                            _udpServer.SendAsync(b, b.Length, s.UdpEndPoint);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public class BaseMsg { public int msgId; }
+        public class NetMessage<T> { public int msgId; public T data; }
+        public class LoginRequest { public string username; public string password; }
+        public class MoveRequest { public int playerId; public float x; public float y; public float z; }
+        public class MoveBroadcast { public int playerId; public float x; public float y; public float z; }
+        public class PlayerJoinBroadcast { public int playerId; }
+        public class PlayerLeaveBroadcast { public int playerId; }
+        public class AesKeyRequest { public string encryptedKey; }
     }
 
     public class ClientSession
@@ -76,9 +146,11 @@ namespace SimpleGameServer
 
         public int PlayerId { get; private set; } = -1;
 
-        public float X { get; private set; } = 0f;
-        public float Y { get; private set; } = 0f;
-        public float Z { get; private set; } = 0f;
+        public float X { get; set; } = 0f;
+        public float Y { get; set; } = 0f;
+        public float Z { get; set; } = 0f;
+
+        public IPEndPoint UdpEndPoint { get; set; }
 
         private byte[] _cache = new byte[0];
         private const int MaxPacketSize = 1024 * 1024;
@@ -116,7 +188,7 @@ namespace SimpleGameServer
                 {
                     Program._sessions.TryRemove(PlayerId, out _);
 
-                    var leaveBroadcast = new PlayerLeaveBroadcast { playerId = PlayerId };
+                    var leaveBroadcast = new Program.PlayerLeaveBroadcast { playerId = PlayerId };
                     foreach (var kv in Program._sessions)
                     {
                         if (kv.Value.PlayerId > 0)
@@ -173,10 +245,7 @@ namespace SimpleGameServer
                 byte[] plainBody;
                 if (_encryptionEnabled)
                 {
-                    try
-                    {
-                        plainBody = DecryptWithAes(body);
-                    }
+                    try { plainBody = DecryptWithAes(body); }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"AES 解密失败: {ex.Message}");
@@ -200,7 +269,7 @@ namespace SimpleGameServer
         private void HandleMessage(byte[] plainBody)
         {
             var json = Encoding.UTF8.GetString(plainBody);
-            var baseMsg = JsonConvert.DeserializeObject<BaseMsg>(json);
+            var baseMsg = JsonConvert.DeserializeObject<Program.BaseMsg>(json);
             int msgId = baseMsg.msgId;
 
             switch (msgId)
@@ -212,7 +281,7 @@ namespace SimpleGameServer
 
                 case MSG_CLIENT_AES_KEY:
                     {
-                        var net = JsonConvert.DeserializeObject<NetMessage<AesKeyRequest>>(json);
+                        var net = JsonConvert.DeserializeObject<Program.NetMessage<Program.AesKeyRequest>>(json);
                         string b64 = net.data.encryptedKey;
                         var encryptedKey = Convert.FromBase64String(b64);
 
@@ -241,14 +310,23 @@ namespace SimpleGameServer
 
                 case MSG_LOGIN_REQUEST:
                     {
-                        var msg = JsonConvert.DeserializeObject<NetMessage<LoginRequest>>(json);
+                        var msg = JsonConvert.DeserializeObject<Program.NetMessage<Program.LoginRequest>>(json);
                         PlayerId = _generatePlayerId();
 
                         foreach (var kv in Program._sessions)
                         {
                             if (kv.Value.PlayerId > 0)
                             {
-                                Send(MSG_PLAYER_JOIN, new { playerId = kv.Value.PlayerId });
+                                Send(MSG_PLAYER_JOIN, new Program.PlayerJoinBroadcast { playerId = kv.Value.PlayerId });
+
+                                var positionSync = new Program.MoveBroadcast
+                                {
+                                    playerId = kv.Value.PlayerId,
+                                    x = kv.Value.X,
+                                    y = kv.Value.Y,
+                                    z = kv.Value.Z
+                                };
+                                Send(MSG_MOVE_BROADCAST, positionSync);
                             }
                         }
 
@@ -257,23 +335,7 @@ namespace SimpleGameServer
                         Console.WriteLine($"玩家登录: id={PlayerId}, name={msg.data.username ?? "unknown"}");
                         Send(MSG_LOGIN_RESPONSE, new { playerId = PlayerId, result = "ok" });
 
-                        foreach (var kv in Program._sessions)
-                        {
-                            if (kv.Value.PlayerId > 0 && kv.Key != PlayerId)
-                            {
-                                var positionSync = new MoveBroadcast
-                                {
-                                    playerId = kv.Value.PlayerId,
-                                    x = kv.Value.X,
-                                    y = kv.Value.Y,
-                                    z = kv.Value.Z
-                                };
-                                Send(MSG_MOVE_BROADCAST, positionSync);
-                                Console.WriteLine($"同步玩家位置给新玩家: playerId={kv.Value.PlayerId}, pos=({kv.Value.X}, {kv.Value.Y}, {kv.Value.Z})");
-                            }
-                        }
-
-                        var joinBroadcast = new PlayerJoinBroadcast { playerId = PlayerId };
+                        var joinBroadcast = new Program.PlayerJoinBroadcast { playerId = PlayerId };
                         foreach (var kv in Program._sessions)
                         {
                             if (kv.Key != PlayerId && kv.Value.PlayerId > 0)
@@ -287,14 +349,16 @@ namespace SimpleGameServer
 
                 case MSG_MOVE_REQUEST:
                     {
-                        var mv = JsonConvert.DeserializeObject<NetMessage<MoveRequest>>(json);
-                        var move = mv.data;
+                        var mv = JsonConvert.DeserializeObject<Program.NetMessage<Program.MoveRequest>>(json);
+                        X = mv.data.x; Y = mv.data.y; Z = mv.data.z;
 
-                        X = move.x;
-                        Y = move.y;
-                        Z = move.z;
-
-                        var broadcast = new MoveBroadcast { playerId = move.playerId, x = move.x, y = move.y, z = move.z };
+                        var broadcast = new Program.MoveBroadcast
+                        {
+                            playerId = mv.data.playerId,
+                            x = mv.data.x,
+                            y = mv.data.y,
+                            z = mv.data.z
+                        };
 
                         foreach (var kv in Program._sessions)
                         {
@@ -303,8 +367,7 @@ namespace SimpleGameServer
                                 kv.Value.Send(MSG_MOVE_BROADCAST, broadcast);
                             }
                         }
-
-                        Console.WriteLine($"玩家移动: id={move.playerId}, pos=({move.x}, {move.y}, {move.z})");
+                        Console.WriteLine($"[TCP] 玩家移动: id={mv.data.playerId}, pos=({mv.data.x}, {mv.data.y}, {mv.data.z})");
                     }
                     break;
 
@@ -328,31 +391,19 @@ namespace SimpleGameServer
         private void Send<T>(int msgId, T obj)
         {
             var body = BuildBody(msgId, obj);
-            byte[] payload;
-            if (_encryptionEnabled && _aesKey != null)
-            {
-                payload = EncryptWithAes(body);
-            }
-            else
-            {
-                payload = body;
-            }
+            byte[] payload = (_encryptionEnabled && _aesKey != null) ? EncryptWithAes(body) : body;
 
             var lenBytes = BitConverter.GetBytes(payload.Length);
             if (BitConverter.IsLittleEndian) Array.Reverse(lenBytes);
             var packet = new byte[4 + payload.Length];
             Array.Copy(lenBytes, 0, packet, 0, 4);
             Array.Copy(payload, 0, packet, 4, payload.Length);
-            try
-            {
-                _stream.Write(packet, 0, packet.Length);
-            }
-            catch { }
+            try { _stream.Write(packet, 0, packet.Length); } catch { }
         }
 
         private byte[] BuildBody<T>(int msgId, T obj)
         {
-            var wrapper = new NetMessage<T> { msgId = msgId, data = obj };
+            var wrapper = new Program.NetMessage<T> { msgId = msgId, data = obj };
             var json = JsonConvert.SerializeObject(wrapper);
             return Encoding.UTF8.GetBytes(json);
         }
@@ -387,17 +438,7 @@ namespace SimpleGameServer
             aes.Mode = CipherMode.CBC;
             aes.Padding = PaddingMode.PKCS7;
             using var dec = aes.CreateDecryptor();
-            var plain = dec.TransformFinalBlock(cipher, 0, cipher.Length);
-            return plain;
+            return dec.TransformFinalBlock(cipher, 0, cipher.Length);
         }
     }
-
-    public class BaseMsg { public int msgId; }
-    public class NetMessage<T> { public int msgId; public T data; }
-    public class LoginRequest { public string username; public string password; }
-    public class MoveRequest { public int playerId; public float x; public float y; public float z; }
-    public class MoveBroadcast { public int playerId; public float x; public float y; public float z; }
-    public class PlayerJoinBroadcast { public int playerId; }
-    public class PlayerLeaveBroadcast { public int playerId; }
-    public class AesKeyRequest { public string encryptedKey; }
 }
